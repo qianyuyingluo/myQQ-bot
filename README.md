@@ -19,3 +19,4 @@
 
 管理页面的“QQ 机器人配置”可填写 AppID 和 AppSecret，点击“保存 QQ 配置”后写入 qqbot_config.json，重启机器人后用于登录。AppSecret 不回显；留空保留已有密钥，更换 AppID 时必须同时填写新密钥。没有 QQ 配置时仍可启动管理页面完成填写。
 "# myQQ-bot" 
+"# myQQ-bot" 
