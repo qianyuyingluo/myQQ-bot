@@ -1,0 +1,272 @@
+import asyncio
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, str(Path(__file__).resolve().parent / '.deps'))
+os.environ['NO_PROXY'] = '127.0.0.1,localhost'
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+import backend
+import bot
+from unittest.mock import AsyncMock, patch
+
+class BackendTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old = backend.CONFIG, backend.PROMPT, backend.DB
+        root = Path(self.temp.name)
+        backend.CONFIG, backend.PROMPT, backend.DB = root/'config.json', root/'systemprompt', root/'db.sqlite3'
+        self.received = []
+        async def mock(request):
+            self.received.append(await request.json())
+            return web.json_response({'id':'test', 'object':'chat.completion','created':1,'model':'test','choices':[{'index':0,'message':{'role':'assistant','content':'收到'},'finish_reason':'stop'}]})
+        app = web.Application()
+        app.router.add_post('/chat/completions', mock)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '127.0.0.1', 0)
+        await self.site.start()
+        port = self.site._server.sockets[0].getsockname()[1]
+        self.cfg = {'base_url': f'http://127.0.0.1:{port}', 'model':'test','api_key':'test','vision':False}
+        self.write_config()
+
+    def write_config(self): backend.CONFIG.write_text(json.dumps(self.cfg), encoding='utf-8')
+
+    async def test_qq_config_migration_and_api(self):
+        root = Path(self.temp.name)
+        target, legacy = root / 'qqbot_config.json', root / 'apikey.txt'
+        with patch.object(backend, 'QQ_CONFIG', target), patch.object(backend, 'LEGACY_QQ_CONFIG', legacy):
+            self.assertEqual(backend.qq_settings(), {'appid': '', 'secret': ''})
+            legacy.write_text(json.dumps({'appid': '123456', 'secret': 'old-test-secret'}), encoding='utf-8')
+            self.assertEqual(backend.qq_settings()['secret'], 'old-test-secret')
+            self.assertTrue(target.exists())
+            self.assertFalse(legacy.exists())
+            app = web.Application(middlewares=[backend.local_only])
+            app.add_routes([web.get('/api/qqbot-config', backend.get_qq_settings), web.post('/api/qqbot-config', backend.update_qq_settings)])
+            async with TestClient(TestServer(app), headers={'Host': '127.0.0.1:8766'}) as client:
+                response = await client.get('/api/qqbot-config')
+                self.assertEqual(await response.json(), {'appid': '123456', 'has_secret': True})
+                response = await client.post('/api/qqbot-config', json={'appid': '123456', 'secret': ''})
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(target.read_text())['secret'], 'old-test-secret')
+                before = target.read_bytes()
+                for invalid in ({'appid': '654321', 'secret': ''}, {'appid': 'invalid', 'secret': 'test'}, {'appid': '123456', 'secret': 123}, []):
+                    response = await client.post('/api/qqbot-config', json=invalid)
+                    self.assertEqual(response.status, 400)
+                    self.assertEqual(target.read_bytes(), before)
+                response = await client.post('/api/qqbot-config', json={'appid': '654321', 'secret': 'new-test-secret'})
+                self.assertEqual(await response.json(), {'ok': True, 'restart_required': True})
+                self.assertEqual(json.loads(target.read_text()), {'appid': '654321', 'secret': 'new-test-secret'})
+                response = await client.get('/api/qqbot-config')
+                self.assertNotIn('new-test-secret', await response.text())
+                response = await client.post('/api/qqbot-config', json={'appid': '123', 'secret': 'test'}, headers={'Origin': 'https://example.com'})
+                self.assertEqual(response.status, 403)
+            legacy.write_text(json.dumps({'appid': '123456', 'secret': 'stale-test-secret'}), encoding='utf-8')
+            self.assertEqual(backend.qq_settings()['appid'], '654321')
+
+    async def asyncTearDown(self):
+        await self.runner.cleanup()
+        backend.CONFIG, backend.PROMPT, backend.DB = self.old
+        self.temp.cleanup()
+
+    async def test_images_and_context(self):
+        image = SimpleNamespace(content_type='image/png', url='https://example.com/image.png')
+        await backend.answer('one', '你好', [image])
+        self.assertNotIn('image_url', json.dumps(self.received[-1]))
+        self.assertEqual(len(backend.history('one')), 2)
+        await backend.answer('one', '', [image])
+        self.assertEqual(len(backend.history('one')), 2)
+        self.cfg['vision'] = True
+        self.write_config()
+        async def fake_prepare(content, session): return content
+        with patch.object(backend, 'prepare_images', side_effect=fake_prepare):
+            await backend.answer('one', '看看', [image])
+        self.assertIn('image_url', json.dumps(self.received[-1]))
+        self.cfg['vision'] = False
+        self.write_config()
+        await backend.answer('one', '继续', [])
+        self.assertNotIn('image_url', json.dumps(self.received[-1]))
+        await backend.answer('two', '另一个用户', [])
+        self.assertNotIn('你好', json.dumps(self.received[-1], ensure_ascii=False))
+
+    async def test_expired_image_skipped_from_history(self):
+        self.cfg['vision'] = True
+        self.write_config()
+        content = [{'type':'text', 'text':'之前的问题'}, {'type':'image_url', 'image_url':{'url':'https://example.com/expired.png'}}]
+        backend.save_turn('one', content, '之前的回答')
+        await backend.answer('one', '继续', [])
+        sent = json.dumps(self.received[-1], ensure_ascii=False)
+        self.assertIn('之前的问题', sent)
+        self.assertNotIn('image_url', sent)
+        result = await backend.answer('one', '', [SimpleNamespace(content_type='image/png', url='https://example.com/expired.png')])
+        self.assertIn('无法读取', result)
+
+    async def test_limit_isolation_and_migration(self):
+        for i in range(18):
+            backend.save_turn('私聊:A', f'A{i}', f'答{i}')
+        backend.save_turn('私聊:B', 'B的消息', 'B的回复')
+        backend.save_turn('群聊:G:A', '群消息', '群回复')
+        with backend.db() as conn:
+            rows = conn.execute('SELECT role, content FROM messages WHERE chat=? ORDER BY id', ('私聊:A',)).fetchall()
+            self.assertEqual(len(rows), 20)
+            self.assertEqual(json.loads(rows[0][1]), 'A8')
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('私聊:B',)).fetchone()[0], 2)
+
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('群聊:G:A',)).fetchone()[0], 2)
+            for i in range(35):
+                conn.execute('INSERT INTO messages(chat,role,content) VALUES(?,?,?)', ('旧会话', 'user', json.dumps(str(i))))
+        backend.initialize_memory()
+        with backend.db() as conn:
+            rows = conn.execute('SELECT content FROM messages WHERE chat=? ORDER BY id', ('旧会话',)).fetchall()
+            self.assertEqual(len(rows), 20)
+            self.assertEqual(json.loads(rows[0][0]), '15')
+        await backend.answer('私聊:A', '当前消息', [])
+        sent = self.received[-1]['messages']
+        self.assertEqual(len(sent), 21)  # 系统提示词 + 最多 20 条聊天消息
+        self.assertEqual(sent[-1]['content'], '当前消息')
+        with backend.db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('私聊:A',)).fetchone()[0], 20)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('私聊:B',)).fetchone()[0], 2)
+
+    async def test_rate_limit_arrival_and_isolation(self):
+        limiter = backend.RateLimiter()
+        for i in range(10): self.assertTrue(limiter.allow('A', 10, now=float(i)))
+        self.assertFalse(limiter.allow('A', 10, now=10))
+        self.assertTrue(limiter.allow('B', 10, now=10))
+        self.assertTrue(limiter.allow('A', 10, now=60))
+        self.assertFalse(limiter.allow('A', 1, now=60))
+        self.assertTrue(limiter.allow('A', 20, now=60))
+
+        bot.rate_limiter = backend.RateLimiter()
+        self.cfg['requests_per_minute'] = 1
+        self.write_config()
+        msg = SimpleNamespace(author=SimpleNamespace(user_openid='A'), content='你好', attachments=[], reply=AsyncMock())
+        with patch.object(bot, 'answer', new=AsyncMock(return_value='正常')) as mocked:
+            await bot.Catgirl.handle(None, msg, '私聊')
+            await bot.Catgirl.handle(None, msg, '私聊')
+        self.assertEqual(mocked.await_count, 1)
+        self.assertEqual(msg.reply.await_args_list[1].kwargs['content'], '樱洛繁忙中')
+        self.assertEqual(backend.history('私聊:A'), [])
+
+    async def test_admin_limit_settings(self):
+        app = web.Application()
+        app.add_routes([web.get('/api/settings', backend.get_settings), web.post('/api/settings', backend.update_settings)])
+        async with TestClient(TestServer(app)) as client:
+            response = await client.get('/api/settings')
+            initial = await response.json()
+            self.assertEqual(initial['requests_per_minute'], 10)
+            self.assertEqual((initial['private_context_limit'], initial['group_context_limit']), (20, 100))
+            data = {'base_url': 'https://api.deepseek.com', 'model': 'deepseek-flash', 'prompt': '测试', 'requests_per_minute': 3, 'private_context_limit': 4, 'group_context_limit': 6}
+            for i in range(5):
+                backend.save_turn('私聊:A', str(i), '回复')
+                backend.save_group_message('群聊:G', 'A', str(i), [])
+            response = await client.post('/api/settings', json=data)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(backend.settings()['requests_per_minute'], 3)
+            with backend.db() as conn:
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('私聊:A',)).fetchone()[0], 4)
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('群聊:G',)).fetchone()[0], 5)
+            self.assertEqual(len(backend.history('群聊:G')), 5)
+            backend.save_group_message('群聊:G', 'A', '新群消息', [])
+            backend.save_group_message('群聊:G', 'A', '再一条', [])
+            with backend.db() as conn:
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('群聊:G',)).fetchone()[0], 6)
+            self.assertEqual(len(backend.history('群聊:G')), 5)
+
+            data['requests_per_minute'] = 0
+            response = await client.post('/api/settings', json=data)
+            self.assertEqual(response.status, 400)
+            self.assertEqual(backend.settings()['requests_per_minute'], 3)
+            data['requests_per_minute'] = 3
+            data['group_context_limit'] = 1
+            response = await client.post('/api/settings', json=data)
+            self.assertEqual(response.status, 400)
+            self.assertEqual(backend.settings()['group_context_limit'], 6)
+
+    async def test_private_clean_command(self):
+        bot.rate_limiter = backend.RateLimiter()
+        backend.save_turn('私聊:A', '旧消息', '旧回复')
+        backend.save_turn('私聊:B', '其他用户', '其他回复')
+        backend.save_turn('群聊:G:A', '群消息', '群回复')
+        msg = SimpleNamespace(author=SimpleNamespace(user_openid='A'), content=' /clean context ', attachments=[], reply=AsyncMock())
+        with patch.object(bot, 'answer', new=AsyncMock()) as mocked:
+            await bot.Catgirl.handle(None, msg, '私聊')
+        mocked.assert_not_awaited()
+        self.assertEqual(backend.history('私聊:A'), [])
+        self.assertEqual(len(backend.history('私聊:B')), 2)
+        self.assertEqual(len(backend.history('群聊:G:A')), 2)
+        self.assertIn('已清除', msg.reply.await_args.kwargs['content'])
+
+    async def test_auto_reply_push_and_fallback(self):
+        bot.rate_limiter = backend.RateLimiter()
+        api = SimpleNamespace(post_c2c_message=AsyncMock(), post_group_message=AsyncMock())
+        client = SimpleNamespace(api=api)
+        msg = SimpleNamespace(author=SimpleNamespace(user_openid='A'), content='/auto reply', attachments=[], reply=AsyncMock())
+        with patch.object(bot, 'answer', new=AsyncMock()) as model:
+            await bot.Catgirl.handle(client, msg, '私聊')
+            model.assert_not_awaited()
+        api.post_c2c_message.assert_awaited_once()
+        self.assertNotIn('msg_id', api.post_c2c_message.await_args.kwargs)
+        msg.reply.assert_not_awaited()
+        api.post_c2c_message.side_effect = RuntimeError('push rejected')
+        await bot.Catgirl.handle(client, msg, '私聊')
+        msg.reply.assert_awaited_once()
+        self.assertEqual(backend.history('私聊:A'), [])
+
+    async def test_group_shared_context_and_full_event(self):
+        bot.rate_limiter = backend.RateLimiter()
+        bot.seen_messages.clear()
+        a = SimpleNamespace(author=SimpleNamespace(member_openid='A'), group_openid='G', content='你好', attachments=[], reply=AsyncMock())
+        b = SimpleNamespace(author=SimpleNamespace(member_openid='B'), group_openid='G', content='他说什么', attachments=[], reply=AsyncMock())
+        await bot.Catgirl.handle(None, a, '群聊')
+        await bot.Catgirl.handle(None, b, '群聊')
+        sent = self.received[-1]['messages']
+        self.assertTrue(any('群成员 A' in str(m.get('content')) for m in sent))
+        self.assertIn('群成员 B', str(sent[-1]['content']))
+        self.assertEqual(len(backend.history('群聊:G')), 4)
+        self.assertEqual(backend.history('私聊:A'), [])
+        dispatched = []
+        state = bot.ConnectionState(lambda *args: dispatched.append(args), None)
+        self.assertIn('group_message_create', state.parsers)
+        raw = {'id':'evt', 'd':{'id':'msg', 'group_openid':'G', 'author':{'member_openid':'A'}, 'content':'你好', 'mentions':[{'is_you':True}]}}
+        state.parsers['group_message_create'](raw)
+        self.assertEqual(dispatched[0][0], 'group_message_create')
+        self.assertTrue(bot.is_bot_mentioned(raw, SimpleNamespace(id=123)))
+        self.assertFalse(bot.is_bot_mentioned({'d':{'mentions':[{'id':'other'}], 'content':'普通消息'}}, SimpleNamespace(id=123)))
+        fake = SimpleNamespace(robot=SimpleNamespace(id=123), api=None, handle=AsyncMock())
+        await bot.Catgirl.on_group_message_create(fake, raw)
+        await bot.Catgirl.on_group_message_create(fake, raw)
+        self.assertEqual(fake.handle.await_count, 1)
+        await bot.Catgirl.on_group_message_create(fake, {'d':{'content':'普通消息'}})
+        self.assertEqual(fake.handle.await_count, 1)
+
+    async def test_full_group_messages_become_context_without_reply(self):
+        bot.seen_messages.clear()
+        fake = SimpleNamespace(robot=SimpleNamespace(id=123), api=None, handle=AsyncMock())
+        def payload(mid, group, user, content, attachments=None):
+            return {'id':'event', 'd':{'id':mid, 'group_openid':group, 'author':{'member_openid':user}, 'content':content, 'attachments':attachments or []}}
+        one = payload('one', 'G', 'A', '我喜欢猫')
+        await bot.Catgirl.on_group_message_create(fake, one)
+        await bot.Catgirl.on_group_message_create(fake, one)
+        await bot.Catgirl.on_group_message_create(fake, payload('two', 'G', 'B', '我也喜欢'))
+        await bot.Catgirl.on_group_message_create(fake, payload('other', 'H', 'C', '另一群的消息'))
+        image = {'content_type':'image/png', 'url':'https://example.com/test.png'}
+        await bot.Catgirl.on_group_message_create(fake, payload('image', 'G', 'A', '', [image]))
+        fake.handle.assert_not_awaited()
+        self.assertEqual(len(backend.history('群聊:G')), 2)
+        await backend.answer('群聊:G', '[群成员 B] 上面聊了什么', [])
+        sent = json.dumps(self.received[-1]['messages'], ensure_ascii=False)
+        self.assertIn('我喜欢猫', sent)
+        self.assertIn('我也喜欢', sent)
+        self.assertNotIn('另一群的消息', sent)
+        self.assertNotIn('image_url', sent)
+        for i in range(120):
+            await bot.Catgirl.on_group_message_create(fake, payload(f'extra{i}', 'G', 'A', str(i)))
+        with backend.db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages WHERE chat=?', ('群聊:G',)).fetchone()[0], 100)
+
+if __name__ == '__main__': unittest.main()

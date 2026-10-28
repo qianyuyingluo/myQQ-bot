@@ -1,0 +1,41 @@
+# Python dependencies and caches
+.deps/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local credentials and configuration (never publish)
+apikey.txt
+apikey.env
+qqbot_config.json
+.qqbot-*.tmp
+model_config.json
+.env
+.env.*
+!.env.example
+systemprompt
+systemprompt.txt
+
+# Chat history, database backups and runtime logs
+*.log
+conversations.sqlite3*
+conversations-backup-*.sqlite3
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+
+# Device deployment copies, screenshots and temporary transfers
+termux-screen.png
+.deploy-temp/
+.patch-transfer/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
