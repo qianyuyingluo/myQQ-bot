@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import backend
 import bot
 from unittest.mock import AsyncMock, patch
+from datetime import datetime, timezone, timedelta
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -35,6 +36,104 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.write_config()
 
     def write_config(self): backend.CONFIG.write_text(json.dumps(self.cfg), encoding='utf-8')
+
+    async def test_group_names_mentions_and_time_reach_model(self):
+        bot.rate_limiter = backend.RateLimiter()
+        sent = []
+        state = bot.ConnectionState(lambda *args: sent.append(args), None)
+        payload = {'id': 'event', 'd': {'id': 'message', 'group_openid': 'G', 'group_name': '猫娘',
+            'author': {'member_openid': 'A', 'username': '千羽'},
+            'mentions': [{'id': 'B', 'username': 'oi'}, {'id': 'robot', 'is_you': True}],
+            'content': '你问 <@B>'}}
+        state.parsers['group_at_message_create'](payload)
+        message = sent[0][1]
+        self.assertEqual(message.metadata['author_name'], '千羽')
+        message_api = SimpleNamespace(post_group_message=AsyncMock())
+        message._api = message_api
+        fake = SimpleNamespace(robot=SimpleNamespace(id='robot'))
+        with patch.object(backend, 'datetime') as clock:
+            clock.now.return_value = datetime(2026, 10, 28, 18, 19, 0, tzinfo=timezone(timedelta(hours=8)))
+            await bot.Catgirl.handle(fake, message, '群聊')
+        messages = self.received[-1]['messages']
+        self.assertIn('2026-10-28 18:19:00', messages[0]['content'])
+        self.assertIn('星期三', messages[0]['content'])
+        self.assertIn('UTC+08:00', messages[0]['content'])
+        current = messages[-1]['content']
+        for text in ('猫娘', '千羽', 'oi', '群成员 A', '明确 @', '"id": "B"'):
+            self.assertIn(text, current)
+        with backend.db() as conn:
+            ids = [m['id'] for m in backend.group_info.profile(conn, 'G')['members']]
+            self.assertEqual(set(ids), {'A', 'B'})
+        with patch.object(backend, 'datetime') as clock:
+            clock.now.return_value = datetime(2026, 10, 29, 1, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+            await backend.answer('私聊:A', '你好', [])
+        self.assertIn('2026-10-29 01:00:00', self.received[-1]['messages'][0]['content'])
+        self.assertNotIn('oi', json.dumps(self.received[-1], ensure_ascii=False))
+        self.assertNotIn('当前群资料', json.dumps(self.received[-1], ensure_ascii=False))
+        with backend.db() as conn:
+            saved = str(conn.execute('SELECT content FROM messages').fetchall())
+            self.assertNotIn('当前服务器时间', saved)
+            self.assertNotIn('当前群资料', saved)
+
+    async def test_group_profile_alias_validation_and_isolation(self):
+        backend.remember_group({'group_id': 'G', 'group_name': '原群名', 'author_id': 'A', 'author_name': '平台昵称'})
+        backend.remember_group({'group_id': 'H', 'group_name': '另一群', 'author_id': 'A', 'author_name': '别群昵称'})
+        app = web.Application(middlewares=[backend.local_only])
+        app.add_routes([web.get('/api/group-profile', backend.get_group_profile), web.post('/api/group-profile', backend.update_group_profile), web.get('/api/groups', backend.get_groups)])
+        async with TestClient(TestServer(app), headers={'Host': '127.0.0.1:8766'}) as client:
+            data = {'group_id': 'G', 'alias': '猫娘', 'members': [{'id': 'A', 'alias': 'oi'}]}
+            self.assertEqual((await client.post('/api/group-profile', json=data)).status, 200)
+            # Incoming platform data must not overwrite an administrator alias.
+            backend.remember_group({'group_id': 'G', 'group_name': '新群名', 'author_id': 'A', 'author_name': '新昵称'})
+            backend.remember_group({'group_id': 'G', 'author_id': 'A'})
+            profile = await (await client.get('/api/group-profile?group_id=G')).json()
+            self.assertEqual(profile['name'], '猫娘')
+            self.assertEqual(profile['platform_name'], '新群名')
+            self.assertEqual(profile['members'][0]['name'], 'oi')
+            self.assertEqual(profile['members'][0]['platform_name'], '新昵称')
+            for bad in ([], {'group_id': '../G'}, {'group_id': 'G', 'alias': 'x'*121}, {'group_id': 'G', 'members': [{'id': 'A'}, {'id': 'A'}]}):
+                self.assertEqual((await client.post('/api/group-profile', json=bad)).status, 400)
+            self.assertEqual((await client.post('/api/group-profile', json=data, headers={'Origin': 'https://example.com'})).status, 403)
+            await backend.answer('群聊:G', '你好', [])
+            request = json.dumps(self.received[-1], ensure_ascii=False)
+            self.assertIn('oi', request)
+            self.assertNotIn('别群昵称', request)
+            data['alias'], data['members'][0]['alias'] = '', ''
+            await client.post('/api/group-profile', json=data)
+            profile = await (await client.get('/api/group-profile?group_id=G')).json()
+            self.assertEqual(profile['name'], '新群名')
+            self.assertEqual(profile['members'][0]['name'], '新昵称')
+
+    async def test_full_group_metadata_protocol_mentions_and_history_seed(self):
+        bot.seen_messages.clear()
+        fake = SimpleNamespace(robot=SimpleNamespace(id='robot'), api=None, handle=AsyncMock())
+        raw = {'id': 'event', 'd': {'id': 'm1', 'group_openid': 'G', 'author': {'member_openid': 'B', 'username': 'oi'},
+               'content': '你好 <qqbot-at-user id="A" />'}}
+        await bot.Catgirl.on_group_message_create(fake, raw)
+        fake.handle.assert_not_awaited()
+        with backend.db() as conn:
+            profile = backend.group_info.profile(conn, 'G')
+            self.assertEqual({m['id'] for m in profile['members']}, {'A', 'B'})
+        self.assertIn('oi', backend.history('群聊:G')[0][1])
+        self.assertIn('明确 @', backend.history('群聊:G')[0][1])
+        self.assertTrue(bot.is_bot_mentioned({'d': {'content': '<qqbot-at-user id="robot" />'}}, fake.robot))
+        self.assertFalse(bot.is_bot_mentioned(raw, fake.robot))
+        backend.save_turn('群聊:OLD', '[群成员 OLDUSER] 旧消息', '旧回复')
+        backend.initialize_memory()
+        with backend.db() as conn:
+            self.assertEqual(backend.group_info.profile(conn, 'OLD')['members'][0]['id'], 'OLDUSER')
+
+    async def test_group_image_failure_does_not_send_only_metadata(self):
+        self.cfg['vision'] = True
+        self.write_config()
+        result = await backend.answer('群聊:G', '', [SimpleNamespace(content_type='image/png', url='https://example.com/expired.png')], speaker='A')
+        self.assertIn('无法读取', result)
+        self.assertEqual(self.received, [])
+        self.cfg['vision'] = False
+        self.write_config()
+        result = await backend.answer('群聊:G', '', [SimpleNamespace(content_type='image/png', url='https://example.com/expired.png')], speaker='A')
+        self.assertEqual(self.received, [])
+        self.assertEqual(backend.history('群聊:G'), [])
 
     async def test_qq_config_migration_and_api(self):
         root = Path(self.temp.name)
