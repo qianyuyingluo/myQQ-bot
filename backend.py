@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 import group_info
 import proactive
+import coding_agent
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -99,6 +100,7 @@ def db():
         conn.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, chat TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP)')
         group_info.create_tables(conn)
         proactive.create_tables(conn)
+        coding_agent.create_tables(conn)
         yield conn
         conn.commit()
     finally:
@@ -363,7 +365,7 @@ async def update_group_profile(request):
 
 async def get_proactive_targets(request):
     with db() as conn:
-        rows = conn.execute("SELECT chat FROM messages UNION SELECT chat FROM proactive_config UNION SELECT '群聊:'||group_id FROM group_profiles").fetchall()
+        rows = conn.execute("SELECT chat FROM messages UNION SELECT chat FROM proactive_config UNION SELECT chat FROM agent_config UNION SELECT '群聊:'||group_id FROM group_profiles").fetchall()
         targets = []
         for (chat,) in rows:
             if proactive.valid_chat(chat):
@@ -449,7 +451,9 @@ async def messages(request):
     return web.json_response([{'role': r, 'content': json.loads(c), 'created': t} for r,c,t in rows])
 
 def run_admin():
+    import agent_admin
     app = web.Application(middlewares=[local_only], client_max_size=65536)
+    agent_admin.register(app)
     app.add_routes([web.get('/', index), web.get('/api/settings', get_settings), web.post('/api/settings', update_settings), web.get('/api/chats', chats), web.get('/api/messages', messages)])
     app.add_routes([web.get('/api/qqbot-config', get_qq_settings), web.post('/api/qqbot-config', update_qq_settings)])
     app.add_routes([web.get('/api/groups', get_groups), web.get('/api/group-profile', get_group_profile), web.post('/api/group-profile', update_group_profile)])

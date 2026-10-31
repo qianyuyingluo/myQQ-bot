@@ -21,6 +21,7 @@ systemprompt.txt
 
 # Chat history, database backups and runtime logs
 *.log
+*.log.*
 conversations.sqlite3*
 conversations-backup-*.sqlite3
 *.sqlite3
@@ -32,6 +33,9 @@ conversations-backup-*.sqlite3
 termux-screen.png
 .deploy-temp/
 .patch-transfer/
+.agent-runtime/
+# Local reference project (the integrated tools live in workspace_agent/)
+/LabAI/
 
 # Editor and OS files
 .idea/
